@@ -83,7 +83,7 @@ async def sync_gssoc_data():
             "repo_url": project.get('repo_url', ''),
             "admin_name": project.get('admin_name', ''),
             "tech_stack": project.get('tech_stack', []),
-            "topics": project.get('gh'or {}).get('topics', []),
+            "topics": (project.get('gh') or {}).get('topics', []),
             "open_issues": total_open,
             "closed_issues": total_closed,
             "open_assigned_issues": open_assigned,
