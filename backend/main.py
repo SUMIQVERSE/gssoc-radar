@@ -1,104 +1,128 @@
-from fastapi import FastAPI
-import requests
 import os
+import requests
+from fastapi import FastAPI, BackgroundTasks
+from supabase import create_client, Client
 from dotenv import load_dotenv
+from datetime import datetime, timezone
 
+# Load Environment Variables
 load_dotenv()
 
+# ==========================================
+# 1. APP & DATABASE INITIALIZATION
+# ==========================================
 app = FastAPI()
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+# Supabase Setup
+SUPABASE_URL = os.getenv("NEXT_PUBLIC_SUPABASE_URL")
+SUPABASE_KEY = os.getenv("NEXT_PUBLIC_SUPABASE_ANON_KEY")
+
+if SUPABASE_URL and SUPABASE_KEY:
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+else:
+    print("⚠️ WARNING: Supabase credentials missing!")
+    supabase = None
+
+# GitHub Token Setup
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+GITHUB_HEADERS = {"Authorization": f"Bearer {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
 
-GITHUB_HEADERS = {
-    "Authorization": f"token {GITHUB_TOKEN}",
-    "Accept": "application/vnd.github.v3+json"
-}
-
-SUPABASE_HEADERS = {
-    "apikey": SUPABASE_KEY,
-    "Authorization": f"Bearer {SUPABASE_KEY}",
-    "Content-Type": "application/json",
-    "Prefer": "resolution=merge-duplicates"
-}
-
-async def fetch_github_metrics(owner_repo: str):
-    url = f"https://api.github.com/repos/{owner_repo}/issues?state=all&per_page=100"
-    response = requests.get(url, headers=GITHUB_HEADERS)
-    
-    if response.status_code != 200:
-        return {"total_open": 0, "total_closed": 0, "open_assigned": 0, "closed_assigned": 0}
-        
-    issues = response.json()
-    actual_issues = [i for i in issues if "pull_request" not in i]
-    
-    total_open = sum(1 for i in actual_issues if i['state'] == 'open')
-    total_closed = sum(1 for i in actual_issues if i['state'] == 'closed')
-    
-    open_assigned = sum(1 for i in actual_issues if i['state'] == 'open' and i.get('assignee') is not None)
-    closed_assigned = sum(1 for i in actual_issues if i['state'] == 'closed' and i.get('assignee') is not None)
-    
-    return {
-        "total_open": total_open,
-        "total_closed": total_closed,
-        "open_assigned": open_assigned,
-        "closed_assigned": closed_assigned
-    }
-
-@app.get("/sync")
-async def sync_gssoc_data():
-    gssoc_url = "https://gssoc.girlscript.org/api/projects"
+# ==========================================
+# 2. CORE BACKGROUND LOGIC (NO TIMEOUT)
+# ==========================================
+def process_all_projects():
+    print("🚀 Background Sync Started for 300+ Repos...")
     
     try:
-        gssoc_data = requests.get(gssoc_url).json()
+        JSON_URL = "https://gssoc.girlscript.org/api/projects" 
+        
+        response = requests.get(JSON_URL)
+        if response.status_code != 200:
+            print("❌ Error: JSON file load nahi hui!")
+            return
+            
+        projects = response.json()
+        processed_projects = []
+
+        for project in projects:
+            try:
+                # GitHub Topics
+                topics = (project.get('gh') or {}).get('topics', [])
+                
+                # GitHub Repo Link & Path Extraction
+                repo_link = project.get("project_link", "")
+                repo_path = repo_link.replace("https://github.com/", "").strip("/")
+                
+                stars = 0
+                forks = 0
+                issues = 0
+                live_data = {}
+                
+                # GitHub API Fetch (With Token Headers)
+                if repo_path:
+                    api_url = f"https://api.github.com/repos/{repo_path}"
+                    gh_response = requests.get(api_url, headers=GITHUB_HEADERS)
+                    
+                    if gh_response.status_code == 200:
+                        live_data = gh_response.json()
+                        stars = live_data.get("stargazers_count", 0)
+                        forks = live_data.get("forks_count", 0)
+                        issues = live_data.get("open_issues_count", 0)
+                        
+                        if not topics:
+                            topics = live_data.get("topics", [])
+                    else:
+                        print(f"⚠️ GitHub API fail for {repo_path}: Code {gh_response.status_code}")
+
+                # Data Insertion
+                data_to_insert = {
+                    "owner_repo": repo_path, 
+                    "name": project.get("name", repo_path.split("/")[-1]),
+                    "repo_url": repo_link,
+                    "admin_name": project.get("admin_name", repo_path.split("/")[0]),
+                    "tech_stack": project.get("tech_stack", []), 
+                    "topics": topics,
+                    "open_issues": issues, 
+                    "closed_issues": project.get("closed_issues", 0), 
+                    "assigned_issues": project.get("assigned_issues", 0),
+                    "health_score": project.get("health_score", 0.0),
+                    "open_assigned_issues": project.get("open_assigned_issues", 0),
+                    "closed_assigned_issues": project.get("closed_assigned_issues", 0),
+                    "description": live_data.get("description", project.get("description", "")),
+                    "last_updated": datetime.now(timezone.utc).isoformat()
+                }
+                
+                # 5. Supabase Upsert
+                if supabase:
+                    supabase.table("gssoc_projects").upsert(data_to_insert).execute()
+                
+                processed_projects.append(project)
+                print(f"✅ Processed: {repo_path}")
+                
+            except Exception as item_error:
+                print(f"❌ Error in {project.get('name', 'Unknown Repo')}: {item_error}")
+                continue 
+
+        print(f"🎉 SUCCESS! All {len(processed_projects)} projects synced in background!")
+        
     except Exception as e:
-        return {"error": "Failed to fetch GSSoC API"}
-    
-    processed_projects = []
-    
-    for project in gssoc_data.get('projects', []):
-        owner_repo = project.get('owner_repo')
-        if not owner_repo: continue
-            
-        print(f"Processing: {owner_repo}")
-        live_metrics = await fetch_github_metrics(owner_repo)
-        
-        total_open = live_metrics['total_open']
-        total_closed = live_metrics['total_closed']
-        open_assigned = live_metrics['open_assigned']
-        closed_assigned = live_metrics['closed_assigned']
-        
-        total_assigned = open_assigned + closed_assigned
-        
-        if total_open > 0:
-            health_score = round((total_assigned / (total_open + total_closed)) * 100, 2)
-        else:
-            health_score = 0
-            
-        project_record = {
-            "owner_repo": owner_repo,
-            "name": project.get('name', 'Unknown'),
-            "description": project.get('description', ''),
-            "repo_url": project.get('repo_url', ''),
-            "admin_name": project.get('admin_name', ''),
-            "tech_stack": project.get('tech_stack', []),
-            "topics": (project.get('gh') or {}).get('topics', []),
-            "open_issues": total_open,
-            "closed_issues": total_closed,
-            "open_assigned_issues": open_assigned,
-            "closed_assigned_issues": closed_assigned,
-            "assigned_issues": total_assigned,
-            "health_score": health_score
-        }
-        processed_projects.append(project_record)
-        
-    supabase_endpoint = f"{SUPABASE_URL}/rest/v1/gssoc_projects?on_conflict=owner_repo"
-    
-    db_response = requests.post(supabase_endpoint, headers=SUPABASE_HEADERS, json=processed_projects)
-    
-    if db_response.status_code not in [200, 201]:
-        print("Supabase Error:", db_response.text) 
-        return {"status": "failed", "error": db_response.json()}
-    
-    return {"status": "success", "synced_count": len(processed_projects)}
+        print(f"💥 Background task crashed: {e}")
+
+# ==========================================
+# 3. FASTAPI ROUTES
+# ==========================================
+@app.get("/sync")
+def start_sync(background_tasks: BackgroundTasks):
+    """
+    Cron-job hit point: Yeh turant 200 OK bhejega aur piche loop chalata rahega.
+    """
+    background_tasks.add_task(process_all_projects)
+    return {
+        "status": "success", 
+        "message": "Background Sync Started! 300+ repos 2-3 minute mein update ho jayenge. 🚀",
+        "note": "Check Render Logs or Supabase Dashboard to see live progress."
+    }
+
+@app.get("/")
+def read_root():
+    return {"status": "GSSoC Radar Backend is Live & Running! 🎉"}
