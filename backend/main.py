@@ -46,6 +46,11 @@ def process_all_projects():
 
         for project in projects:
             try:
+                # CRITICAL FIX: Agar API galti se koi text/string bhej de toh usko ignore karo
+                if not isinstance(project, dict):
+                    print(f"⚠️ Skipped invalid project data: {project}")
+                    continue
+
                 # GitHub Topics
                 topics = (project.get('gh') or {}).get('topics', [])
                 
@@ -79,7 +84,7 @@ def process_all_projects():
                     "owner_repo": repo_path, 
                     "name": project.get("name", repo_path.split("/")[-1]),
                     "repo_url": repo_link,
-                    "admin_name": project.get("admin_name", repo_path.split("/")[0]),
+                    "admin_name": project.get("admin_name", repo_path.split("/")[0] if repo_path else ""),
                     "tech_stack": project.get("tech_stack", []), 
                     "topics": topics,
                     "open_issues": issues, 
@@ -100,7 +105,9 @@ def process_all_projects():
                 print(f"✅ Processed: {repo_path}")
                 
             except Exception as item_error:
-                print(f"❌ Error in {project.get('name', 'Unknown Repo')}: {item_error}")
+                # 🚨 SAFE ERROR LOGGING FIX
+                repo_name = project.get('name', 'Unknown') if isinstance(project, dict) else 'Unknown'
+                print(f"❌ Error in {repo_name}: {item_error}")
                 continue 
 
         print(f"🎉 SUCCESS! All {len(processed_projects)} projects synced in background!")
